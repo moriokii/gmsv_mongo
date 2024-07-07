@@ -3,16 +3,18 @@ use std::ffi::{CStr, CString};
 use futures::TryStreamExt;
 use mongodb::{Collection, Database};
 use mongodb::bson::{Bson, Document};
-use rglua::lua::{lua_pushboolean, lua_setmetatable, luaL_checkstring, luaL_getmetatable, LuaState};
+use rglua::lua::{luaL_checkstring, luaL_getmetatable, lua_pushboolean, lua_setmetatable, LuaState};
 use rglua::prelude::{lua_gettop, lua_istable, lua_newtable, lua_next, lua_pop, lua_pushnil, lua_pushnumber, lua_pushstring, lua_rawseti, lua_settable, lua_tonumber, lua_tostring, lua_type};
+use rglua::userdata::{Angle, Vector};
 
 use crate::logger::{log, LogLevel};
 use crate::mongo::MONGO_WORKER;
-use crate::utils::luautils::{read_userdata, write_userdata};
+use crate::utils::luautils::{check_userdata, read_userdata, write_userdata};
 
 const LUA_TNUMBER: i32 = 3;
 const LUA_TSTRING: i32 = 4;
 const LUA_TTABLE: i32 = 5;
+const LUA_TUDATA: i32 = 7;
 const LUA_TNIL: i32 = 0;
 
 unsafe fn get_table_key(l: LuaState, key_type: i32) -> Result<String, String> {
@@ -72,6 +74,26 @@ fn lua_table_to_bson(l: LuaState, index: i32) -> Result<Document, String> {
                     let nested_doc = lua_table_to_bson(l, lua_gettop(l))?;
                     doc.insert(key, Bson::Document(nested_doc));
                 }
+                LUA_TUDATA => {
+                    if let Ok(angle) = check_userdata::<Angle>(l, -1, cstr!("Angle")) {
+                        let mut value = Document::new();
+                        value.insert("type", "Angle");
+                        value.insert("p", angle.p);
+                        value.insert("y", angle.y);
+                        value.insert("r", angle.r);
+
+                        doc.insert(key, Bson::Document(value));
+                    } else if let Ok(vector) = check_userdata::<Vector>(l, -1, cstr!("Vector")) {
+                        let mut value = Document::new();
+                        value.insert("type", "Vector");
+                        value.insert("x", vector.x);
+                        value.insert("y", vector.y);
+                        value.insert("z", vector.z);
+
+                        doc.insert(key, Bson::Document(value));
+                    }
+                }
+
                 _ => {
                     lua_pop(l, 1);
                     return Err("Unsupported value type".to_string());
