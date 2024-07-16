@@ -1,11 +1,18 @@
 use std::ffi::{CStr, CString};
 
 use futures::TryStreamExt;
-use mongodb::{Collection, Database};
 use mongodb::bson::{Bson, Document};
-use rglua::lua::{luaL_checkstring, luaL_getmetatable, lua_pushboolean, lua_setmetatable, LuaState};
-use rglua::prelude::{lua_gettop, lua_istable, lua_newtable, lua_next, lua_pop, lua_pushnil, lua_pushnumber, lua_pushstring, lua_rawseti, lua_settable, lua_tonumber, lua_tostring, lua_type};
+use mongodb::{Collection, Database};
+use rglua::lua::{
+    luaL_checkstring, luaL_getmetatable, lua_pushangle, lua_pushboolean, lua_pushvector,
+    lua_setmetatable, LuaState,
+};
+use rglua::prelude::{
+    lua_gettop, lua_istable, lua_newtable, lua_next, lua_pop, lua_pushnil, lua_pushnumber,
+    lua_pushstring, lua_rawseti, lua_settable, lua_tonumber, lua_tostring, lua_type,
+};
 use rglua::userdata::{Angle, Vector};
+use serde::Deserialize;
 
 use crate::logger::{log, LogLevel};
 use crate::mongo::MONGO_WORKER;
@@ -77,18 +84,19 @@ fn lua_table_to_bson(l: LuaState, index: i32) -> Result<Document, String> {
                 LUA_TUDATA => {
                     if let Ok(angle) = check_userdata::<Angle>(l, -1, cstr!("Angle")) {
                         let mut value = Document::new();
-                        value.insert("type", "Angle");
-                        value.insert("p", angle.p);
-                        value.insert("y", angle.y);
-                        value.insert("r", angle.r);
+                        value.insert("_type", "Angle");
+                        value.insert("_p", angle.p);
+                        value.insert("_y", angle.y);
+                        value.insert("_r", angle.r);
 
                         doc.insert(key, Bson::Document(value));
                     } else if let Ok(vector) = check_userdata::<Vector>(l, -1, cstr!("Vector")) {
                         let mut value = Document::new();
-                        value.insert("type", "Vector");
-                        value.insert("x", vector.x);
-                        value.insert("y", vector.y);
-                        value.insert("z", vector.z);
+                        value.insert("_type", "Vector");
+
+                        value.insert("_x", vector.x);
+                        value.insert("_y", vector.y);
+                        value.insert("_z", vector.z);
 
                         doc.insert(key, Bson::Document(value));
                     }
@@ -105,6 +113,20 @@ fn lua_table_to_bson(l: LuaState, index: i32) -> Result<Document, String> {
     Ok(doc)
 }
 
+#[derive(Debug, Deserialize)]
+struct DAngle {
+    _p: f32,
+    _y: f32,
+    _r: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct DVector {
+    _x: f32,
+    _y: f32,
+    _z: f32,
+}
+
 fn bson_to_lua_table(l: LuaState, doc: Document) {
     #[allow(unused_unsafe)]
     unsafe {
@@ -113,15 +135,79 @@ fn bson_to_lua_table(l: LuaState, doc: Document) {
             let key = CString::new(key.to_string()).unwrap();
             lua_pushstring(l, key.as_ptr());
             match value {
+                Bson::ObjectId(v) => {
+                    let cstr = CString::new(v.to_hex().clone()).unwrap();
+                    lua_pushstring(l, cstr.as_ptr())
+                }
                 Bson::Double(v) => lua_pushnumber(l, *v),
                 Bson::String(v) => {
                     let cstr = CString::new(v.clone()).unwrap();
                     lua_pushstring(l, cstr.as_ptr())
                 }
                 Bson::Document(v) => {
-                    bson_to_lua_table(l, v.clone());
-                    lua_settable(l, -3);
-                    continue;
+                    if v.contains_key("_type") {
+                        let typ_r = v.get_str("_type");
+                        match typ_r {
+                            Ok(typ) => {
+                                match typ {
+                                    "Angle" => {
+                                        let angle_r: Result<DAngle, bson::de::Error> =
+                                            bson::from_document(v.clone());
+                                        match angle_r {
+                                            Ok(angle) => {
+                                                lua_pushangle(
+                                                    l,
+                                                    Angle::new(angle._p, angle._y, angle._r),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                log(
+                                                    LogLevel::Error,
+                                                    &format!("Cannot get p,y,r fields: {}", err),
+                                                );
+                                                lua_pushnil(l);
+                                            }
+                                        }
+                                    }
+                                    "Vector" => {
+                                        let vector_r: Result<DVector, bson::de::Error> =
+                                            bson::from_document(v.clone());
+                                        match vector_r {
+                                            Ok(vector) => {
+                                                lua_pushvector(
+                                                    l,
+                                                    Vector::new(vector._x, vector._y, vector._z),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                log(
+                                                    LogLevel::Error,
+                                                    &format!("Cannot get x,y,z fields: {}", err),
+                                                );
+                                                lua_pushnil(l)
+                                            }
+                                        }
+                                    }
+
+                                    _ => {
+                                        lua_pushnil(l)
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                log(
+                                    LogLevel::Error,
+                                    &format!("Field _type isn't string, fix it! Error: {}", err),
+                                );
+                                lua_pushnil(l);
+                            }
+                        }
+                    } else {
+                        // is it unnecessary??
+                        bson_to_lua_table(l, v.clone());
+                        lua_settable(l, -3);
+                        continue;
+                    }
                 }
                 _ => lua_pushnil(l),
             }
@@ -129,7 +215,6 @@ fn bson_to_lua_table(l: LuaState, doc: Document) {
         }
     }
 }
-
 
 // _    _   _   _      _____ _   _ _   _  ____ _____ ___ ___  _   _ ____
 // | |  | | | | / \    |  ___| | | | \ | |/ ___|_   _|_ _/ _ \| \ | / ___|
@@ -145,16 +230,17 @@ pub fn get_collection(l: LuaState) -> i32 {
 
     let collection: mongodb::Collection<Document> = db.collection(collection_name);
 
-    let collection_list = MONGO_WORKER.block_on(async {
-        db.list_collection_names().await
-    });
+    let collection_list = MONGO_WORKER.block_on(async { db.list_collection_names().await });
 
     if collection_list.is_err() {
         log(LogLevel::Error, "Failed to retrieve collection names.");
         return 0;
     }
 
-    if !collection_list.unwrap().contains(&collection_name.to_string()) {
+    if !collection_list
+        .unwrap()
+        .contains(&collection_name.to_string())
+    {
         lua_pushnil(l);
         return 1;
     }
@@ -172,9 +258,7 @@ pub fn drop_collection(l: LuaState) -> i32 {
 
     let collection_name = rstr!(luaL_checkstring(l, 2));
 
-    let collection_list = MONGO_WORKER.block_on(async {
-        db.list_collection_names().await
-    });
+    let collection_list = MONGO_WORKER.block_on(async { db.list_collection_names().await });
 
     if collection_list.is_err() {
         log(LogLevel::Error, "Failed to retrieve collection names.");
@@ -182,8 +266,18 @@ pub fn drop_collection(l: LuaState) -> i32 {
         return 1;
     }
 
-    if !collection_list.unwrap().contains(&collection_name.to_string()) {
-        log(LogLevel::Warning, &format!("Trying to drop collection '{}', but it doesn't exist in '{}'.", collection_name, db.name()));
+    if !collection_list
+        .unwrap()
+        .contains(&collection_name.to_string())
+    {
+        log(
+            LogLevel::Warning,
+            &format!(
+                "Trying to drop collection '{}', but it doesn't exist in '{}'.",
+                collection_name,
+                db.name()
+            ),
+        );
         lua_pushboolean(l, false as i32);
         return 1;
     }
@@ -202,26 +296,28 @@ pub fn create_collection(_l: LuaState) -> i32 {
     let db: Database = read_userdata(_l).unwrap();
     let collection_name = rstr!(luaL_checkstring(_l, 2));
 
-    let collection_list = MONGO_WORKER.block_on(async {
-        db.list_collection_names().await
-    });
+    let collection_list = MONGO_WORKER.block_on(async { db.list_collection_names().await });
 
     if collection_list.is_err() {
         log(LogLevel::Error, "Failed to retrieve collection names.");
         return 0;
     }
 
-    if collection_list.unwrap().contains(&collection_name.to_string()) {
+    if collection_list
+        .unwrap()
+        .contains(&collection_name.to_string())
+    {
         lua_pushnil(_l);
         return 1;
     }
 
-    let result = MONGO_WORKER.block_on(async {
-        db.create_collection(collection_name).await
-    });
+    let result = MONGO_WORKER.block_on(async { db.create_collection(collection_name).await });
 
     if result.is_err() {
-        log(LogLevel::Error, &format!("Failed to create collection '{}'.", collection_name));
+        log(
+            LogLevel::Error,
+            &format!("Failed to create collection '{}'.", collection_name),
+        );
     }
 
     0
@@ -232,7 +328,10 @@ pub fn insert(l: LuaState) -> i32 {
     let collection: Collection<Document> = match read_userdata(l) {
         Ok(col) => col,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to get collection: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to get collection: {}", err),
+            );
             lua_pushboolean(l, false as i32);
             return 1;
         }
@@ -241,18 +340,22 @@ pub fn insert(l: LuaState) -> i32 {
     let doc = match lua_table_to_bson(l, 2) {
         Ok(doc) => doc,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to convert table to BSON: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to convert table to BSON: {}", err),
+            );
             lua_pushboolean(l, false as i32);
             return 1;
         }
     };
 
-    let insert_result = MONGO_WORKER.block_on(async {
-        collection.insert_one(doc).await
-    });
+    let insert_result = MONGO_WORKER.block_on(async { collection.insert_one(doc).await });
 
     if let Err(err) = insert_result {
-        log(LogLevel::Error, &format!("Failed to insert document: {}", err));
+        log(
+            LogLevel::Error,
+            &format!("Failed to insert document: {}", err),
+        );
         lua_pushboolean(l, false as i32);
         return 1;
     }
@@ -266,7 +369,10 @@ pub fn find(l: LuaState) -> i32 {
     let collection: Collection<Document> = match read_userdata(l) {
         Ok(col) => col,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to get collection: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to get collection: {}", err),
+            );
             lua_pushnil(l);
             return 1;
         }
@@ -275,15 +381,16 @@ pub fn find(l: LuaState) -> i32 {
     let filter = match lua_table_to_bson(l, 2) {
         Ok(doc) => doc,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to convert table to BSON: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to convert table to BSON: {}", err),
+            );
             lua_pushnil(l);
             return 1;
         }
     };
 
-    let find_result = MONGO_WORKER.block_on(async {
-        collection.find(filter).await
-    });
+    let find_result = MONGO_WORKER.block_on(async { collection.find(filter).await });
 
     if let Err(err) = find_result {
         log(LogLevel::Error, &format!("Failed to execute find: {}", err));
@@ -292,9 +399,8 @@ pub fn find(l: LuaState) -> i32 {
     }
 
     let cursor = find_result.unwrap();
-    let docs: Vec<Document> = MONGO_WORKER.block_on(async {
-        cursor.try_collect().await.unwrap_or_else(|_| Vec::new())
-    });
+    let docs: Vec<Document> =
+        MONGO_WORKER.block_on(async { cursor.try_collect().await.unwrap_or_else(|_| Vec::new()) });
 
     lua_newtable(l);
     for (i, doc) in docs.iter().enumerate() {
@@ -310,7 +416,10 @@ pub fn update(l: LuaState) -> i32 {
     let collection: Collection<Document> = match read_userdata(l) {
         Ok(col) => col,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to get collection: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to get collection: {}", err),
+            );
             lua_pushboolean(l, 0);
             return 1;
         }
@@ -319,7 +428,10 @@ pub fn update(l: LuaState) -> i32 {
     let filter = match lua_table_to_bson(l, 2) {
         Ok(doc) => doc,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to convert filter to BSON: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to convert filter to BSON: {}", err),
+            );
             lua_pushboolean(l, 0);
             return 1;
         }
@@ -328,20 +440,25 @@ pub fn update(l: LuaState) -> i32 {
     let update = match lua_table_to_bson(l, 3) {
         Ok(doc) => doc,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to convert update to BSON: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to convert update to BSON: {}", err),
+            );
             lua_pushboolean(l, 0);
             return 1;
         }
     };
 
-    let update_result = MONGO_WORKER.block_on(async {
-        collection.update_many(filter, update).await
-    });
+    let update_result =
+        MONGO_WORKER.block_on(async { collection.update_many(filter, update).await });
 
     match update_result {
         Ok(_) => lua_pushboolean(l, 1),
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to execute update: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to execute update: {}", err),
+            );
             lua_pushboolean(l, 0);
         }
     }
@@ -354,7 +471,10 @@ pub fn delete(l: LuaState) -> i32 {
     let collection: Collection<Document> = match read_userdata(l) {
         Ok(col) => col,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to get collection: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to get collection: {}", err),
+            );
             lua_pushboolean(l, 0);
             return 1;
         }
@@ -363,20 +483,24 @@ pub fn delete(l: LuaState) -> i32 {
     let filter = match lua_table_to_bson(l, 2) {
         Ok(doc) => doc,
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to convert filter to BSON: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to convert filter to BSON: {}", err),
+            );
             lua_pushboolean(l, 0);
             return 1;
         }
     };
 
-    let delete_result = MONGO_WORKER.block_on(async {
-        collection.delete_many(filter).await
-    });
+    let delete_result = MONGO_WORKER.block_on(async { collection.delete_many(filter).await });
 
     match delete_result {
         Ok(_) => lua_pushboolean(l, 1),
         Err(err) => {
-            log(LogLevel::Error, &format!("Failed to execute delete: {}", err));
+            log(
+                LogLevel::Error,
+                &format!("Failed to execute delete: {}", err),
+            );
             lua_pushboolean(l, 0);
         }
     }
