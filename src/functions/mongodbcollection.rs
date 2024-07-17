@@ -4,8 +4,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{Bson, Document};
 use mongodb::{Collection, Database};
 use rglua::lua::{
-    luaL_checkstring, luaL_getmetatable, lua_pushangle, lua_pushboolean, lua_pushvector,
-    lua_setmetatable, LuaState,
+    luaL_checkstring, luaL_getmetatable, lua_pushangle, lua_pushboolean, lua_pushvector, lua_setmetatable, LuaState
 };
 use rglua::prelude::{
     lua_gettop, lua_istable, lua_newtable, lua_next, lua_pop, lua_pushnil, lua_pushnumber,
@@ -16,7 +15,7 @@ use serde::Deserialize;
 
 use crate::logger::{log, LogLevel};
 use crate::mongo::MONGO_WORKER;
-use crate::utils::luautils::{check_userdata, read_userdata, write_userdata};
+use crate::utils::luautils::{check_userdata, read_boolean, read_userdata, write_userdata};
 
 const LUA_TNUMBER: i32 = 3;
 const LUA_TSTRING: i32 = 4;
@@ -449,8 +448,10 @@ pub fn update(l: LuaState) -> i32 {
         }
     };
 
+    let upsert = read_boolean(l, 4);
+
     let update_result =
-        MONGO_WORKER.block_on(async { collection.update_many(filter, update).await });
+        MONGO_WORKER.block_on(async { collection.update_many(filter, update).upsert(upsert).await });
 
     match update_result {
         Ok(_) => lua_pushboolean(l, 1),

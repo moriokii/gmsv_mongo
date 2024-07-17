@@ -1,4 +1,4 @@
-use rglua::{lua::{lua_getfield, lua_getmetatable, lua_pop, lua_rawequal, LuaString, Userdata, REGISTRYINDEX}, prelude::{lua_newuserdata, lua_touserdata, LuaState}};
+use rglua::{lua::{lua_getfield, lua_getmetatable, lua_pop, lua_rawequal, lua_toboolean, LuaString, Userdata, REGISTRYINDEX}, prelude::{lua_newuserdata, lua_touserdata, LuaState}};
 
 pub fn write_userdata<T>(l: LuaState, data: T) {
     let data_ptr = lua_newuserdata(l, std::mem::size_of::<T>()) as *mut T;
@@ -35,4 +35,8 @@ pub fn check_userdata<T: Clone>(l: LuaState, idx: i32, key: LuaString) -> Result
         lua_pop(l, 2);
         Err("Not rawequal".to_string())
     }
+}
+
+pub fn read_boolean(l: LuaState, idx: i32) -> bool { 
+    return lua_toboolean(l, idx) == 1;
 }
